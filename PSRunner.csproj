@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Bouwt PSRunner.dll op mac/linux (geen Windows nodig):
+         dotnet build PSRunner.csproj -c Release
+       - net48 reference assemblies via nuget
+       - SMA reference = PowerShell 5.1 signatures (assemblyversion 3.0.0.0)
+         -> bindt op de target aan de GAC's System.Management.Automation -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>PSRunner</AssemblyName>
+    <OutputType>Library</OutputType>
+    <OutputPath>.</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <DebugType>none</DebugType>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.PowerShell.5.1.ReferenceAssemblies" Version="1.0.0" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>
